@@ -1,12 +1,3 @@
-import contextlib
-import unittest
-import torch
-
-from comfy import model_management
-
-from . import first_block_cache
-
-
 class ApplyFBCacheOnModel:
 
     @classmethod
@@ -93,7 +84,7 @@ class ApplyFBCacheOnModel:
         if residual_diff_threshold <= 0.0 or max_consecutive_cache_hits == 0:
             return (model, )
 
-        first_block_cache.patch_get_output_data()
+        patch_get_output_data()
 
         using_validation = max_consecutive_cache_hits >= 0 or start > 0 or end < 1
         if using_validation:
@@ -124,41 +115,22 @@ class ApplyFBCacheOnModel:
             nonlocal prev_input_state, prev_timestep, consecutive_cache_hits
             prev_input_state = prev_timestep = None
             consecutive_cache_hits = 0
-            first_block_cache.set_current_cache_context(
-                first_block_cache.create_cache_context())
+            set_current_cache_context(
+                create_cache_context())
 
         def ensure_cache_state(model_input: torch.Tensor, timestep: float):
             # Validates the current cache state and hits/time tracking variables
-            # and triggers a reset if necessary. Also updates current_timestep and
-            # maintains the cache context sequence number.
+            # and triggers a reset if necessary. Also updates current_timestep.
             nonlocal current_timestep
             input_state = (model_input.shape, model_input.dtype, model_input.device)
-            cache_context = first_block_cache.get_current_cache_context()
-            # We reset when:
             need_reset = (
-                # The previous timestep or input state is not set
                 prev_timestep is None or
-                prev_input_state is None or
-                # Or dtype/device have changed
-                prev_input_state[1:] != input_state[1:] or
-                # Or the input state after the batch dimension has changed
-                prev_input_state[0][1:] != input_state[0][1:] or
-                # Or there is no cache context (in this case reset is just making a context)
-                cache_context is None or
-                # Or the current timestep is higher than the previous one
-                timestep > prev_timestep
+                prev_input_state != input_state or
+                get_current_cache_context() is None or
+                timestep >= prev_timestep
             )
             if need_reset:
                 reset_cache_state()
-            elif timestep == prev_timestep:
-                # When the current timestep is the same as the previous, we assume ComfyUI has split up
-                # the model evaluation into multiple chunks. In this case, we increment the sequence number.
-                # Note: No need to check if cache_context is None for these branches as need_reset would be True
-                #       if so.
-                cache_context.sequence_num += 1
-            elif timestep < prev_timestep:
-                # When the timestep is less than the previous one, we can reset the context sequence number
-                cache_context.sequence_num = 0
             current_timestep = timestep
 
         def update_cache_state(model_input: torch.Tensor, timestep: float):
@@ -173,9 +145,10 @@ class ApplyFBCacheOnModel:
         if diffusion_model.__class__.__name__ in ("UNetModel", "Flux"):
 
             if diffusion_model.__class__.__name__ == "UNetModel":
-                create_patch_function = first_block_cache.create_patch_unet_model__forward
+                create_patch_function = create_patch_unet_model__forward
             elif diffusion_model.__class__.__name__ == "Flux":
-                create_patch_function = first_block_cache.create_patch_flux_forward_orig
+                # FIX: Referência atualizada para a função corrigida
+                create_patch_function = create_patch_flux_forward
             else:
                 raise ValueError(
                     f"Unsupported model {diffusion_model.__class__.__name__}")
@@ -243,7 +216,7 @@ class ApplyFBCacheOnModel:
                         diffusion_model)
 
             cached_transformer_blocks = torch.nn.ModuleList([
-                first_block_cache.CachedTransformerBlocks(
+                CachedTransformerBlocks(
                     None if double_blocks_name is None else getattr(
                         diffusion_model, double_blocks_name),
                     None if single_blocks_name is None else getattr(

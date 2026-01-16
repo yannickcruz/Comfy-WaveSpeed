@@ -227,6 +227,98 @@ def apply_cached_residual(
 
 
 # ==============================================================================
+# MODEL ARCHITECTURE DETECTION
+# ==============================================================================
+
+def detect_model_architecture(model):
+    """
+    Detects diffusion model architecture based on specific structural attributes.
+    This is more reliable than checking class names.
+    
+    Returns: 'flux', 'unet', 'zimage', or None
+    """
+    try:
+        diffusion_model = model.model.diffusion_model
+    except AttributeError:
+        return None
+    
+    # FLUX Detection: Has both double_blocks AND single_blocks
+    # This is the most distinctive feature of FLUX's dual-stream architecture
+    has_double_blocks = hasattr(diffusion_model, 'double_blocks')
+    has_single_blocks = hasattr(diffusion_model, 'single_blocks')
+    
+    if has_double_blocks and has_single_blocks:
+        return 'flux'
+    
+    # UNet Detection: Has input_blocks, middle_block, output_blocks
+    # Classic UNet structure used in SD1.5, SDXL, etc.
+    has_input_blocks = hasattr(diffusion_model, 'input_blocks')
+    has_middle_block = hasattr(diffusion_model, 'middle_block')
+    has_output_blocks = hasattr(diffusion_model, 'output_blocks')
+    
+    if has_input_blocks and has_middle_block and has_output_blocks:
+        return 'unet'
+    
+    # Z-Image Detection: Has transformer_blocks (single list) + modality stems
+    # S3-DiT uses unified transformer blocks with modality-specific preprocessing
+    has_transformer_blocks = hasattr(diffusion_model, 'transformer_blocks')
+    
+    # Z-Image specific: Check for modality stems (img_stem, text_stem)
+    # or check for 3D RoPE embedder (pe_embedder with 3D support)
+    has_img_stem = hasattr(diffusion_model, 'img_stem')
+    has_text_stem = hasattr(diffusion_model, 'text_stem')
+    has_pe_embedder = hasattr(diffusion_model, 'pe_embedder')
+    
+    # Additional check: Z-Image has img_in and txt_in for token projection
+    has_img_in = hasattr(diffusion_model, 'img_in')
+    has_txt_in = hasattr(diffusion_model, 'txt_in')
+    
+    # Z-Image detection logic:
+    # Must have transformer_blocks AND either:
+    # - Modality stems (img_stem/text_stem), OR
+    # - Token projection layers (img_in/txt_in) with pe_embedder
+    if has_transformer_blocks:
+        if (has_img_stem or has_text_stem):
+            return 'zimage'
+        if has_img_in and has_txt_in and has_pe_embedder:
+            return 'zimage'
+    
+    return None
+
+
+def get_model_patch_function(model):
+    """
+    Returns the appropriate patch function based on model architecture.
+    Raises clear error if model is not supported.
+    """
+    arch = detect_model_architecture(model)
+    
+    if arch == 'flux':
+        return create_patch_flux_forward
+    elif arch == 'unet':
+        return create_patch_unet_model__forward
+    elif arch == 'zimage':
+        return create_patch_zimage_forward
+    else:
+        # Provide helpful error message with debug info
+        try:
+            diffusion_model = model.model.diffusion_model
+            attrs = dir(diffusion_model)
+            # Filter to main structural attributes
+            structural_attrs = [a for a in attrs if not a.startswith('_') and 
+                               any(keyword in a.lower() for keyword in 
+                                   ['block', 'layer', 'stem', 'embed', 'in', 'out'])]
+            
+            raise ValueError(
+                f"[WaveSpeed] Unsupported model architecture. Could not detect FLUX, UNet, or Z-Image.\n"
+                f"Detected attributes: {structural_attrs[:10]}\n"
+                f"Please report this issue with your model type."
+            )
+        except Exception as e:
+            raise ValueError(f"[WaveSpeed] Could not analyze model structure: {str(e)}")
+
+
+# ==============================================================================
 # FLUX PATCH - COMPLETELY REWRITTEN VERSION
 # ==============================================================================
 
@@ -395,24 +487,22 @@ def create_patch_flux_forward(
         # Packing logic for 4D tensors
         is_packed = False
         unpack_params = None
-
+        
         if img.ndim == 4 and img_ids is None:
             is_packed = True
             b, c, h, w = img.shape
             
-            # Add padding if the dimensions were odd
+            # Adds padding if dimensions are odd (not divisible by 2)
             pad_h = h % 2
             pad_w = w % 2
             
             if pad_h != 0 or pad_w != 0:
                 img = F.pad(img, (0, pad_w, 0, pad_h), mode='reflect')
-                _, _, h_padded, w_padded = img.shape
-            else:
-                h_padded, w_padded = h, w
             
             img = F.pixel_unshuffle(img, 2)
             b, c_packed, h_packed, w_packed = img.shape
             
+            # Always includes pad_h and pad_w in tuple (even if they are 0)
             unpack_params = (b, c, h, w, c_packed, h_packed, w_packed, pad_h, pad_w)
             
             # Creates IDs
@@ -539,7 +629,8 @@ def create_patch_flux_forward(
             img = img.reshape(b, h_packed, w_packed, c_packed)
             img = img.permute(0, 3, 1, 2)
             img = F.pixel_shuffle(img, 2)
-
+            
+            # Removes padding if it was added
             if pad_h != 0 or pad_w != 0:
                 img = img[:, :, :h, :w]
         
@@ -724,6 +815,244 @@ def create_patch_unet_model__forward(
             yield
     
     return patch__forward
+
+
+# ==============================================================================
+# Z-IMAGE TURBO PATCH (S3-DiT Single-Stream Architecture)
+# ==============================================================================
+
+def create_patch_zimage_forward(
+    model,
+    *,
+    residual_diff_threshold: float,
+    validate_can_use_cache_function=None
+):
+    """
+    Creates patch for Z-Image Turbo model (S3-DiT architecture) with cache logic.
+    Unlike FLUX's dual-stream, Z-Image uses unified single-stream processing.
+    """
+    from torch import Tensor
+    
+    # Import timestep_embedding
+    try:
+        from comfy.ldm.flux.model import timestep_embedding
+    except ImportError:
+        try:
+            from comfy.ldm.flux.layers import timestep_embedding
+        except ImportError:
+            def timestep_embedding(timesteps, dim, max_period=10000):
+                half = dim // 2
+                freqs = torch.exp(
+                    -torch.log(torch.tensor(max_period)) * 
+                    torch.arange(start=0, end=half, dtype=torch.float32) / half
+                ).to(device=timesteps.device)
+                args = timesteps[:, None].float() * freqs[None]
+                embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+                if dim % 2:
+                    embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+                return embedding
+    
+    def call_remaining_blocks(
+        self, tokens, vec, pe, timesteps, 
+        transformer_options, blocks_replace
+    ):
+        """
+        Executes transformer blocks 1-N for S3-DiT and returns total residual.
+        All modalities (text, image, semantic) are already concatenated in tokens.
+        """
+        # Saves initial state to compute total residual
+        tokens_initial = tokens.clone()
+        
+        # S3-DiT processes all tokens in a unified stream through 30 blocks
+        for i in range(1, len(self.transformer_blocks)):
+            block = self.transformer_blocks[i]
+            
+            # Check if there's a custom block replacement
+            if ("transformer_block", i) in blocks_replace:
+                def block_wrap(args):
+                    out = {}
+                    out["tokens"] = block(
+                        args["tokens"], 
+                        vec=args["vec"], 
+                        pe=args["pe"]
+                    )
+                    return out
+                
+                out = blocks_replace[("transformer_block", i)](
+                    {"tokens": tokens, "vec": vec, "pe": pe},
+                    {"original_block": block_wrap, "transformer_options": transformer_options}
+                )
+                tokens = out["tokens"]
+            else:
+                # Standard forward through transformer block
+                # Z-Image blocks use: tokens, vec (timestep conditioning), pe (3D RoPE)
+                tokens = block(tokens, vec=vec, pe=pe)
+        
+        tokens = tokens.contiguous()
+        
+        # Computes total residual: (final output) - (input after block 0)
+        residual = tokens - tokens_initial
+        residual = residual.contiguous()
+        
+        return tokens, residual
+    
+    def forward(
+        self,
+        x: Tensor,
+        timesteps: Tensor,
+        **kwargs
+    ) -> Tensor:
+        """
+        Modified forward for Z-Image S3-DiT with intelligent caching.
+        """
+        # Extract arguments
+        context = kwargs.get("context")  # Text embeddings
+        y = kwargs.get("y")  # Additional conditioning (if any)
+        transformer_options = kwargs.get("transformer_options", {})
+        
+        if context is None:
+            raise ValueError("[WaveSpeed] Missing required argument: context (text embeddings)")
+        
+        patches_replace = transformer_options.get("patches_replace", {})
+        blocks_replace = patches_replace.get("dit", {})
+        
+        # Z-Image doesn't use pixel_unshuffle like FLUX
+        # Input x is already in latent space from VAE encoder
+        # Shape: (batch, channels, height, width) -> needs to be flattened to tokens
+        
+        batch_size, channels, height, width = x.shape
+        
+        # Process modality-specific stems (text and image)
+        # In Z-Image: lightweight 2-block transformers per modality for initial alignment
+        if hasattr(self, 'img_stem'):
+            img_tokens = self.img_stem(x)  # Image modality stem
+        else:
+            # Fallback: flatten and project
+            img_tokens = x.flatten(2).transpose(1, 2)  # (B, H*W, C)
+            img_tokens = self.img_in(img_tokens) if hasattr(self, 'img_in') else img_tokens
+        
+        if hasattr(self, 'text_stem'):
+            text_tokens = self.text_stem(context)  # Text modality stem
+        else:
+            text_tokens = self.txt_in(context) if hasattr(self, 'txt_in') else context
+        
+        # Concatenate all modalities into single token sequence (S3-DiT key feature)
+        # Order: [text_tokens, img_tokens] or [text_tokens, semantic_tokens, img_tokens]
+        tokens = torch.cat([text_tokens, img_tokens], dim=1)
+        
+        # Timestep conditioning (vec)
+        # Z-Image uses similar timestep embedding to FLUX
+        if hasattr(self, 'time_in'):
+            vec = self.time_in(timestep_embedding(timesteps, 256).to(tokens.dtype))
+        else:
+            vec = timesteps  # Fallback
+        
+        # Add y conditioning if present (class labels, guidance scale, etc)
+        if y is not None and hasattr(self, 'vector_in'):
+            vec = vec + self.vector_in(y)
+        
+        # 3D RoPE position encoding (unique to Z-Image)
+        # Encodes: modality type, spatial position (x/y for image), temporal (for text)
+        if hasattr(self, 'pe_embedder'):
+            # Create position IDs for concatenated sequence
+            text_len = text_tokens.shape[1]
+            img_len = img_tokens.shape[1]
+            
+            # Position IDs: [modality_id, spatial_x, spatial_y]
+            pos_ids = torch.zeros(batch_size, text_len + img_len, 3, 
+                                 device=tokens.device, dtype=tokens.dtype)
+            
+            # Text positions: modality=0, spatial positions based on sequence
+            pos_ids[:, :text_len, 0] = 0  # Text modality
+            pos_ids[:, :text_len, 1] = torch.arange(text_len, device=tokens.device).float()
+            
+            # Image positions: modality=1, spatial x/y from grid
+            pos_ids[:, text_len:, 0] = 1  # Image modality
+            img_h, img_w = height, width
+            y_pos = torch.arange(img_h, device=tokens.device).repeat_interleave(img_w)
+            x_pos = torch.arange(img_w, device=tokens.device).repeat(img_h)
+            pos_ids[:, text_len:, 1] = y_pos.float()
+            pos_ids[:, text_len:, 2] = x_pos.float()
+            
+            pe = self.pe_embedder(pos_ids)
+        else:
+            pe = None
+        
+        # EXECUTE ONLY BLOCK 0
+        tokens_before_block0 = tokens.clone()
+        
+        block0 = self.transformer_blocks[0]
+        
+        if ("transformer_block", 0) in blocks_replace:
+            def block_wrap(args):
+                out = {}
+                out["tokens"] = block0(args["tokens"], vec=args["vec"], pe=args["pe"])
+                return out
+            
+            out = blocks_replace[("transformer_block", 0)](
+                {"tokens": tokens, "vec": vec, "pe": pe},
+                {"original_block": block_wrap, "transformer_options": transformer_options}
+            )
+            tokens = out["tokens"]
+        else:
+            tokens = block0(tokens, vec=vec, pe=pe)
+        
+        # Compute block 0 residual
+        first_residual = tokens - tokens_before_block0
+        first_residual = first_residual.contiguous()
+        
+        # Decide whether to use cache
+        can_use_cache = get_can_use_cache(first_residual, residual_diff_threshold)
+        
+        if validate_can_use_cache_function:
+            can_use_cache = validate_can_use_cache_function(can_use_cache)
+        
+        # Graph break for PyTorch
+        torch._dynamo.graph_break()
+        
+        if can_use_cache:
+            # CACHE HIT: Apply cached residual with scale correction
+            tokens = apply_cached_residual(tokens, first_residual)
+            
+            ctx = get_current_cache_context()
+            if ctx:
+                ctx.cache_hits += 1
+        else:
+            # CACHE MISS: Execute remaining blocks and save to cache
+            tokens, total_residual = call_remaining_blocks(
+                self, tokens, vec, pe, timesteps, 
+                transformer_options, blocks_replace
+            )
+            
+            set_buffer("first_hidden_states_residual", first_residual)
+            set_buffer("hidden_states_residual", total_residual)
+            
+            ctx = get_current_cache_context()
+            if ctx:
+                ctx.cache_misses += 1
+        
+        torch._dynamo.graph_break()
+        
+        # Final layer - projects tokens back to image space
+        if hasattr(self, 'final_layer'):
+            tokens = self.final_layer(tokens, vec)
+        
+        # Extract only image tokens (remove text/semantic tokens)
+        img_tokens_only = tokens[:, text_tokens.shape[1]:, :]
+        
+        # Reshape back to spatial dimensions
+        output = img_tokens_only.transpose(1, 2).reshape(batch_size, -1, height, width)
+        
+        return output
+    
+    new_forward = forward.__get__(model)
+    
+    @contextlib.contextmanager
+    def patch_forward_context():
+        with unittest.mock.patch.object(model, "forward", new_forward):
+            yield
+    
+    return patch_forward_context
 
 
 # ==============================================================================
@@ -925,7 +1254,10 @@ __all__ = [
     'set_current_cache_context',
     'cache_context',
     'patch_get_output_data',
+    'detect_model_architecture',
+    'get_model_patch_function',
     'create_patch_flux_forward',
     'create_patch_unet_model__forward',
+    'create_patch_zimage_forward',
     'CachedTransformerBlocks',
 ]
